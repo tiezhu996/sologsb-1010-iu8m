@@ -1,11 +1,39 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
-import { analyzeProject, brailleCellCount, makeRule, outputText, updateRuleInSet } from './braille';
+import { analyzeProject, brailleCellCount, lineBraille, makeRule, outputText, pinLine, updateRuleInSet } from './braille';
 import { createInitialProject } from './sample';
 import type { HistoryState, ProofIssue, ProjectState, TextbookLine, VersionSnapshot } from './types';
 
 const STORAGE_KEY = 'sologsb-1010-braille-project-v1';
 const HISTORY_LIMIT = 60;
+
+interface LineDiff {
+  line: TextbookLine;
+  index: number;
+  before: string;
+  after: string;
+}
+
+interface PendingRuleChange {
+  title: string;
+  detail: string;
+  ruleSummary: string;
+  apply: (state: ProjectState) => ProjectState;
+  draft?: Map<string, { source: string; output: string }>;
+}
+
+function diffLines(before: ProjectState, after: ProjectState): LineDiff[] {
+  const diffs: LineDiff[] = [];
+  after.lines.forEach((line, index) => {
+    const beforeLine = before.lines.find((item) => item.id === line.id);
+    if (!beforeLine) return;
+    if (line.override || beforeLine.override) return;
+    const afterText = lineBraille(line);
+    const beforeText = lineBraille(beforeLine);
+    if (afterText !== beforeText) diffs.push({ line, index, before: beforeText, after: afterText });
+  });
+  return diffs;
+}
 
 type HistoryAction =
   | { type: 'commit'; label: string; update: (state: ProjectState) => ProjectState }
@@ -111,16 +139,14 @@ function Section({ title, subtitle, action, children }: { title: string; subtitl
 function RuleSetPanel({
   state,
   onSelect,
-  onUpdateRule,
-  onToggleContractions,
-  onAddRule,
+  onToggleSuspicious,
+  onPreviewChange,
   onRecheck,
 }: {
   state: ProjectState;
   onSelect: (id: string) => void;
-  onUpdateRule: (ruleId: string, patch: Record<string, unknown>) => void;
-  onToggleContractions: () => void;
-  onAddRule: (source: string, output: string, suspicious: boolean) => void;
+  onToggleSuspicious: (ruleId: string) => void;
+  onPreviewChange: (change: PendingRuleChange) => void;
   onRecheck: () => void;
 }) {
   const active = state.ruleSets.find((ruleSet) => ruleSet.id === state.activeRuleSetId) ?? state.ruleSets[0];
@@ -128,11 +154,98 @@ function RuleSetPanel({
   const [newSource, setNewSource] = useState('');
   const [newOutput, setNewOutput] = useState('');
   const [suspicious, setSuspicious] = useState(true);
+  const [drafts, setDrafts] = useState<Map<string, { source: string; output: string }>>(new Map());
   const visibleRules = showAllRules ? active.rules : active.rules.filter((rule) => rule.kind === 'contraction' || rule.suspicious);
+
+  const setDraft = (ruleId: string, patch: Partial<{ source: string; output: string }>) => {
+    setDrafts((current) => {
+      const rule = active.rules.find((item) => item.id === ruleId);
+      if (!rule) return current;
+      const base = current.get(ruleId) ?? { source: rule.source, output: rule.output };
+      const next = { ...base, ...patch };
+      const map = new Map(current);
+      if (next.source === rule.source && next.output === rule.output) map.delete(ruleId);
+      else map.set(ruleId, next);
+      return map;
+    });
+  };
+
+  const previewDrafts = () => {
+    if (drafts.size === 0) return;
+    const entries = [...drafts.entries()];
+    const changed = entries.filter(([id, draft]) => {
+      const rule = active.rules.find((item) => item.id === id);
+      return rule && (rule.source !== draft.source || rule.output !== draft.output);
+    });
+    if (changed.length === 0) return;
+    const detail = changed
+      .map(([id, draft]) => {
+        const rule = active.rules.find((item) => item.id === id)!;
+        return `“${rule.source}” → “${draft.source || '（空）'}”，盲文 “${rule.output}” → “${draft.output || '（空）'}”`;
+      })
+      .join('；');
+    onPreviewChange({
+      title: `修改 ${changed.length} 条规则`,
+      detail,
+      ruleSummary: detail,
+      draft: new Map(changed),
+      apply: (current) => analyzeProject({
+        ...current,
+        ruleSets: current.ruleSets.map((set) => set.id === active.id
+          ? { ...set, rules: set.rules.map((rule) => { const draft = changed.find(([id]) => id === rule.id); return draft ? { ...rule, source: draft[1].source, output: draft[1].output } : rule; }) }
+          : set),
+      }),
+    });
+  };
+
+  const previewToggle = (ruleId: string) => {
+    const rule = active.rules.find((item) => item.id === ruleId);
+    if (!rule) return;
+    const label = rule.enabled ? '停用' : '启用';
+    onPreviewChange({
+      title: `${label}规则 “${rule.source}”`,
+      detail: `${label}后，使用该规则转录的行会按新结果重新生成。`,
+      ruleSummary: `${label}规则 “${rule.source}”`,
+      apply: (current) => analyzeProject({
+        ...current,
+        ruleSets: current.ruleSets.map((set) => set.id === active.id ? updateRuleInSet(set, ruleId, { enabled: !rule.enabled }) : set),
+      }),
+    });
+  };
+
+  const previewContractions = () => {
+    const label = active.contractions ? '关闭' : '开启';
+    onPreviewChange({
+      title: `${label}缩写规则`,
+      detail: `${label}缩写后，所有缩写匹配都会重新转录。`,
+      ruleSummary: `${label}缩写规则`,
+      apply: (current) => analyzeProject({
+        ...current,
+        ruleSets: current.ruleSets.map((set) => set.id === active.id ? { ...set, contractions: !active.contractions } : set),
+      }),
+    });
+  };
+
+  const previewAddRule = () => {
+    const source = newSource.trim();
+    const output = newOutput.trim();
+    if (!source || !output) return;
+    onPreviewChange({
+      title: `新增规则 “${source}”`,
+      detail: `“${source}” → “${output}”${suspicious ? '（标记为可疑）' : ''}`,
+      ruleSummary: `新增规则 “${source}” → “${output}”`,
+      apply: (current) => analyzeProject({
+        ...current,
+        ruleSets: current.ruleSets.map((set) => set.id === current.activeRuleSetId ? { ...set, rules: [...set.rules, makeRule(source, output, suspicious)] } : set),
+      }),
+    });
+    setNewSource('');
+    setNewOutput('');
+  };
 
   return (
     <aside class="left-panel scroll-pane" aria-label="规则集与规则编辑">
-      <Section title="规则集" subtitle="切换后会自动重转录全部行">
+      <Section title="规则集" subtitle="切换后会自动重转录全部行（已定稿的行除外）">
         <div class="stack-sm">
           {state.ruleSets.map((ruleSet) => (
             <button class={`rule-set-card ${ruleSet.id === active.id ? 'active' : ''}`} key={ruleSet.id} onClick={() => onSelect(ruleSet.id)}>
@@ -152,57 +265,60 @@ function RuleSetPanel({
         action={<md-text-button onClick={onRecheck}>重新检查</md-text-button>}
       >
         <div class="inline-controls">
-          <md-checkbox checked={active.contractions} onInput={onToggleContractions} label="启用缩写" />
+          <md-checkbox checked={active.contractions} onInput={previewContractions} label="启用缩写" />
           <md-filled-tonal-button onClick={() => setShowAllRules((value) => !value)}>
             {showAllRules ? '只看常用规则' : '查看全部规则'}
           </md-filled-tonal-button>
         </div>
       </Section>
 
-      <Section title="缩写与标点" subtitle="可疑规则会在校对区生成提醒">
+      <Section title="缩写与标点" subtitle="改动会先预览受影响行，再决定整份应用或只固定当前行">
         <div class="rule-list">
-          {visibleRules.map((rule) => (
-            <div class={`rule-row ${rule.suspicious ? 'suspicious' : ''}`} key={rule.id}>
-              <md-checkbox checked={rule.enabled} onInput={() => onUpdateRule(rule.id, { enabled: !rule.enabled })} aria-label={`启用 ${rule.source}`} />
-              <md-outlined-text-field
-                class="rule-source"
-                value={rule.source}
-                label="原文"
-                onInput={(event: any) => onUpdateRule(rule.id, { source: event.currentTarget.value })}
-              />
-              <md-outlined-text-field
-                class="rule-output"
-                value={rule.output}
-                label="盲文"
-                onInput={(event: any) => onUpdateRule(rule.id, { output: event.currentTarget.value })}
-              />
-              <md-icon-button
-                class={rule.suspicious ? 'warning-button active' : 'warning-button'}
-                aria-label={rule.suspicious ? '取消可疑标记' : '标记为可疑'}
-                title={rule.suspicious ? '取消可疑标记' : '标记为可疑'}
-                onClick={() => onUpdateRule(rule.id, { suspicious: !rule.suspicious })}
-              >
-                {rule.suspicious ? '!' : '○'}
-              </md-icon-button>
-            </div>
-          ))}
+          {visibleRules.map((rule) => {
+            const draft = drafts.get(rule.id);
+            return (
+              <div class={`rule-row ${rule.suspicious ? 'suspicious' : ''} ${draft ? 'draft' : ''}`} key={rule.id}>
+                <md-checkbox checked={rule.enabled} onInput={() => previewToggle(rule.id)} aria-label={`启用 ${rule.source}`} />
+                <md-outlined-text-field
+                  class="rule-source"
+                  value={draft?.source ?? rule.source}
+                  label="原文"
+                  onInput={(event: any) => setDraft(rule.id, { source: event.currentTarget.value })}
+                />
+                <md-outlined-text-field
+                  class="rule-output"
+                  value={draft?.output ?? rule.output}
+                  label="盲文"
+                  onInput={(event: any) => setDraft(rule.id, { output: event.currentTarget.value })}
+                />
+                <md-icon-button
+                  class={rule.suspicious ? 'warning-button active' : 'warning-button'}
+                  aria-label={rule.suspicious ? '取消可疑标记' : '标记为可疑'}
+                  title={rule.suspicious ? '取消可疑标记' : '标记为可疑'}
+                  onClick={() => onToggleSuspicious(rule.id)}
+                >
+                  {rule.suspicious ? '!' : '○'}
+                </md-icon-button>
+                {draft && (
+                  <div class="rule-draft-bar">
+                    <span>未应用</span>
+                    <md-text-button onClick={() => setDraft(rule.id, { source: rule.source, output: rule.output })}>还原</md-text-button>
+                    <md-filled-tonal-button onClick={previewDrafts}>预览改动</md-filled-tonal-button>
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
       </Section>
 
-      <Section title="新增规则" subtitle="可添加缩写、字母组合或自定义符号">
+      <Section title="新增规则" subtitle="添加前会先预览受影响的行">
         <div class="stack-sm">
           <md-outlined-text-field value={newSource} label="原文或组合" onInput={(event: any) => setNewSource(event.currentTarget.value)} />
           <md-outlined-text-field value={newOutput} label="盲文单元" onInput={(event: any) => setNewOutput(event.currentTarget.value)} />
           <md-checkbox checked={suspicious} onInput={() => setSuspicious((value) => !value)} label="标记为可疑规则" />
-          <md-filled-button
-            disabled={!newSource.trim() || !newOutput.trim()}
-            onClick={() => {
-              onAddRule(newSource.trim(), newOutput.trim(), suspicious);
-              setNewSource('');
-              setNewOutput('');
-            }}
-          >
-            添加并检查
+          <md-filled-button disabled={!newSource.trim() || !newOutput.trim()} onClick={previewAddRule}>
+            预览并添加
           </md-filled-button>
         </div>
       </Section>
@@ -220,6 +336,7 @@ function LineCard({
   onNote,
   onStatus,
   onDelete,
+  onClearOverride,
 }: {
   line: TextbookLine;
   index: number;
@@ -230,15 +347,21 @@ function LineCard({
   onNote: (note: string) => void;
   onStatus: (status: TextbookLine['status']) => void;
   onDelete: () => void;
+  onClearOverride: () => void;
 }) {
   const unresolved = issues.filter((issue) => !issue.resolved);
   const lineIssues = unresolved.filter((issue) => issue.lineId === line.id);
+  const pinned = Boolean(line.override && line.override.source === line.source);
 
   return (
-    <article class={`line-card ${selected ? 'selected' : ''}`} id={`line-card-${line.id}`} onClick={onSelect}>
+    <article class={`line-card ${selected ? 'selected' : ''} ${pinned ? 'pinned' : ''}`} id={`line-card-${line.id}`} onClick={onSelect}>
       <div class="line-gutter">
         <span>{String(index + 1).padStart(2, '0')}</span>
-        <span class={`line-status ${line.status}`} title={`状态：${line.status}`} />
+        {pinned ? (
+          <span class="line-status pinned" title="老师定稿：重新检查也会保留；改动原文即失效" />
+        ) : (
+          <span class={`line-status ${line.status}`} title={`状态：${line.status}`} />
+        )}
       </div>
       <div class="line-body">
         <div class="line-source">
@@ -256,10 +379,22 @@ function LineCard({
             <md-icon-button aria-label="删除此行" title="删除此行" onClick={(event: MouseEvent) => { event.stopPropagation(); onDelete(); }}>×</md-icon-button>
           </div>
         </div>
+        {pinned && (
+          <div class="override-bar">
+            <span class="override-badge">老师定稿</span>
+            <span class="override-meta">单独处理 · 重新检查和切换规则集都会保留{line.override ? `（${formatTime(line.override.createdAt)}）` : ''}</span>
+            <md-text-button onClick={(event: MouseEvent) => { event.stopPropagation(); onClearOverride(); }}>改回按规则生成</md-text-button>
+          </div>
+        )}
         <div class="braille-preview" aria-label={`第 ${index + 1} 行盲文预览`}>
           {line.tokens.length === 0 && <span class="empty-preview">空行</span>}
           {line.tokens.map((token) => (
-            token.text === ' ' ? <span class="space-token" title="分词空格" /> : (
+            token.text === ' ' ? <span class="space-token" title="分词空格" /> : token.override ? (
+              <span class="braille-token override" title={`老师定稿 → ${token.braille}`} key={token.id}>
+                <i>老师定稿</i>
+                <span>{token.braille}</span>
+              </span>
+            ) : (
               <span
                 class={`braille-token ${token.suspicious ? 'suspicious' : ''} ${token.braille.includes('⟦') ? 'error' : ''}`}
                 title={`${token.text || '标记'} → ${token.braille}`}
@@ -300,6 +435,7 @@ function EditorPanel({
   onAddLine,
   onSplitLongLines,
   onImport,
+  onClearOverride,
 }: {
   state: ProjectState;
   onSelectLine: (id: string) => void;
@@ -310,6 +446,7 @@ function EditorPanel({
   onAddLine: () => void;
   onSplitLongLines: () => void;
   onImport: (text: string) => void;
+  onClearOverride: (id: string) => void;
 }) {
   const [showImport, setShowImport] = useState(false);
   const [importText, setImportText] = useState('');
@@ -367,6 +504,7 @@ function EditorPanel({
             onNote={(note) => onNote(line.id, note)}
             onStatus={(status) => onStatus(line.id, status)}
             onDelete={() => onDelete(line.id)}
+            onClearOverride={() => onClearOverride(line.id)}
           />
         ))}
       </div>
@@ -428,8 +566,23 @@ function IssuesPanel({
   );
 }
 
-function RuleDetailPanel({ state, onUpdateRule, onDeleteRule }: { state: ProjectState; onUpdateRule: (id: string, patch: Record<string, unknown>) => void; onDeleteRule: (id: string) => void }) {
+function RuleDetailPanel({ state, onUpdateRule, onPreviewChange }: { state: ProjectState; onUpdateRule: (id: string, patch: Record<string, unknown>) => void; onPreviewChange: (change: PendingRuleChange) => void }) {
   const active = state.ruleSets.find((ruleSet) => ruleSet.id === state.activeRuleSetId) ?? state.ruleSets[0];
+
+  const previewDelete = (ruleId: string) => {
+    const rule = active.rules.find((item) => item.id === ruleId);
+    if (!rule) return;
+    onPreviewChange({
+      title: `删除规则 “${rule.source || '数字符'}”`,
+      detail: `删除后，原先由该规则转录的字符将按剩余规则重新生成。`,
+      ruleSummary: `删除规则 “${rule.source || '数字符'}”`,
+      apply: (current) => analyzeProject({
+        ...current,
+        ruleSets: current.ruleSets.map((set) => set.id === current.activeRuleSetId ? { ...set, rules: set.rules.filter((item) => item.id !== ruleId) } : set),
+      }),
+    });
+  };
+
   return (
     <div class="inspector-body">
       <div class="rule-summary">
@@ -446,7 +599,7 @@ function RuleDetailPanel({ state, onUpdateRule, onDeleteRule }: { state: Project
           </div>
           <div class="rule-detail-actions">
             <md-checkbox checked={rule.suspicious} onInput={() => onUpdateRule(rule.id, { suspicious: !rule.suspicious })} label="可疑" />
-            <md-icon-button aria-label="删除规则" title="删除规则" onClick={() => onDeleteRule(rule.id)}>×</md-icon-button>
+            <md-icon-button aria-label="删除规则" title="删除规则" onClick={() => previewDelete(rule.id)}>×</md-icon-button>
           </div>
         </div>
       ))}
@@ -479,16 +632,126 @@ function VersionsPanel({ state, onSnapshot, onRestore }: { state: ProjectState; 
   );
 }
 
+function RuleChangeDialog({
+  state,
+  pending,
+  selectedLineId,
+  onApplyAll,
+  onPinLine,
+  onCancel,
+}: {
+  state: ProjectState;
+  pending: PendingRuleChange;
+  selectedLineId: string;
+  onApplyAll: () => void;
+  onPinLine: (lineId: string) => void;
+  onCancel: () => void;
+}) {
+  const projected = useMemo(() => pending.apply(cloneState(state)), [state, pending]);
+  const diffs = useMemo(() => diffLines(state, projected), [state, projected]);
+  const pinnedCount = state.lines.filter((line) => line.override && line.override.source === line.source).length;
+  const selectedDiff = diffs.find((item) => item.line.id === selectedLineId);
+  const selectedIndex = state.lines.findIndex((line) => line.id === selectedLineId) + 1;
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onCancel();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [onCancel]);
+
+  return (
+    <div class="dialog-backdrop" onClick={onCancel}>
+      <div class="change-dialog" role="dialog" aria-modal="true" aria-label="规则改动预览" onClick={(event: MouseEvent) => event.stopPropagation()}>
+        <header class="change-dialog-head">
+          <div>
+            <span class="eyebrow">规则改动预览</span>
+            <h2>{pending.title}</h2>
+            <p>{pending.detail}</p>
+          </div>
+          <md-icon-button aria-label="关闭预览" title="放弃改动 (Esc)" onClick={onCancel}>×</md-icon-button>
+        </header>
+
+        <div class="change-dialog-summary">
+          <span class="diff-count-badge">{diffs.length} 行会变化</span>
+          {pinnedCount > 0 && <span class="pinned-count-badge">{pinnedCount} 行已定稿，保持老师结果</span>}
+          {diffs.length === 0 && <span class="no-diff-hint">当前没有任何行的盲文结果会改变，可以直接整份应用。</span>}
+        </div>
+
+        <div class="change-dialog-body scroll-pane">
+          {diffs.length === 0 && <div class="empty-state compact"><strong>没有受影响的行</strong><p>规则已改，但现有课文转录结果不变。</p></div>}
+          {diffs.map((item) => (
+            <div class={`diff-row ${item.line.id === selectedLineId ? 'current' : ''}`} key={item.line.id}>
+              <div class="diff-line-meta">
+                <strong>第 {item.index + 1} 行</strong>
+                {item.line.id === selectedLineId && <span class="current-line-tag">当前行</span>}
+                <span class="diff-source" title={item.line.source}>{item.line.source || '（空行）'}</span>
+              </div>
+              <div class="diff-braille before"><span>改前</span><p>{item.before || '—'}</p></div>
+              <div class="diff-arrow" aria-hidden="true">↓</div>
+              <div class="diff-braille after"><span>改后</span><p>{item.after || '—'}</p></div>
+            </div>
+          ))}
+        </div>
+
+        <footer class="change-dialog-foot">
+          <md-text-button onClick={onCancel}>放弃改动</md-text-button>
+          <div class="foot-right">
+            <md-filled-tonal-button
+              disabled={!selectedDiff}
+              title={selectedDiff ? '放弃规则修改，仅把当前行固定为改前的结果' : '当前行不受这次改动影响'}
+              onClick={() => selectedDiff && onPinLine(selectedDiff.line.id)}
+            >
+              {selectedDiff ? `只固定第 ${selectedIndex} 行` : '当前行无变化'}
+            </md-filled-tonal-button>
+            <md-filled-button onClick={onApplyAll}>整份一起改（{diffs.length} 行）</md-filled-button>
+          </div>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const { state, history, commit, undo, redo, restore } = useProject();
   const [inspectorTab, setInspectorTab] = useState<'issues' | 'rules' | 'versions'>('issues');
+  const [pendingChange, setPendingChange] = useState<PendingRuleChange | null>(null);
   const selectedLineRef = useRef(state.selectedLineId);
   selectedLineRef.current = state.selectedLineId;
 
   const activeRuleSet = state.ruleSets.find((ruleSet) => ruleSet.id === state.activeRuleSetId) ?? state.ruleSets[0];
   const unresolvedCount = state.issues.filter((issue) => !issue.resolved).length;
   const approvedCount = state.lines.filter((line) => line.status === 'approved').length;
+  const pinnedCount = state.lines.filter((line) => line.override && line.override.source === line.source).length;
   const progress = state.lines.length ? Math.round((approvedCount / state.lines.length) * 100) : 0;
+
+  const closePendingChange = () => setPendingChange(null);
+
+  const applyPendingChange = () => {
+    const change = pendingChange;
+    if (!change) return;
+    commit(`整份应用规则改动：${change.title}`, (current) => change.apply(current));
+    setPendingChange(null);
+  };
+
+  const pinLineFromPending = (lineId: string) => {
+    const change = pendingChange;
+    if (!change) return;
+    commit('只固定当前行结果', (current) => ({
+      ...current,
+      lines: current.lines.map((line) => line.id === lineId ? pinLine(line, change.ruleSummary) : line),
+      updatedAt: new Date().toISOString(),
+    }));
+    setPendingChange(null);
+  };
+
+  const clearOverride = (lineId: string) => {
+    commit('改回按规则生成', (current) => analyzeProject({
+      ...current,
+      lines: current.lines.map((line) => line.id === lineId ? { ...line, override: undefined } : line),
+    }));
+  };
 
   const selectLine = (lineId: string, scroll = false) => {
     commit('切换当前行', (current) => ({ ...current, selectedLineId: lineId }));
@@ -640,6 +903,17 @@ export default function App() {
         </div>
         <div class="status-stat warning"><strong>{unresolvedCount}</strong><span>未处理问题</span></div>
         <div class="status-stat"><strong>{state.lines.filter((line) => line.status === 'questionable').length}</strong><span>待核对行</span></div>
+        <button
+          class="status-stat pinned-stat"
+          disabled={pinnedCount === 0}
+          title={pinnedCount > 0 ? '定位到第一行单独定稿的课文' : '还没有单独定稿的行'}
+          onClick={() => {
+            const first = state.lines.find((line) => line.override && line.override.source === line.source);
+            if (first) selectLine(first.id, true);
+          }}
+        >
+          <strong>{pinnedCount}</strong><span>单独定稿行</span>
+        </button>
         <div class="status-stat"><strong>{activeRuleSet.rules.filter((rule) => rule.enabled).length}</strong><span>启用规则</span></div>
         <div class="shortcut-hint">快捷键：⌘/Ctrl Z 撤销 · ⇧⌘/Ctrl Z 重做 · ⌘/Ctrl Enter 批准并下一行 · J/K 切换行</div>
       </div>
@@ -648,17 +922,8 @@ export default function App() {
         <RuleSetPanel
           state={state}
           onSelect={(id) => commit('切换规则集并重新检查', (current) => analyzeProject({ ...current, activeRuleSetId: id, issues: [] }))}
-          onUpdateRule={updateRule}
-          onToggleContractions={() => {
-            const ruleSet = activeRuleSet;
-            commit('切换缩写规则', (current) => analyzeProject({ ...current, ruleSets: current.ruleSets.map((set) => set.id === ruleSet.id ? { ...set, contractions: !set.contractions } : set) }));
-          }}
-          onAddRule={(source, output, suspicious) => {
-            commit('新增转写规则', (current) => analyzeProject({
-              ...current,
-              ruleSets: current.ruleSets.map((set) => set.id === current.activeRuleSetId ? { ...set, rules: [...set.rules, makeRule(source, output, suspicious)] } : set),
-            }));
-          }}
+          onToggleSuspicious={(ruleId) => updateRule(ruleId, { suspicious: !(activeRuleSet.rules.find((rule) => rule.id === ruleId)?.suspicious ?? false) })}
+          onPreviewChange={setPendingChange}
           onRecheck={() => commit('重新检查全部内容', analyzeProject)}
         />
 
@@ -684,6 +949,7 @@ export default function App() {
             return analyzeProject({ ...current, lines });
           })}
           onImport={importCourse}
+          onClearOverride={clearOverride}
         />
 
         <aside class="right-panel">
@@ -701,18 +967,24 @@ export default function App() {
               onBatchFix={batchFixRule}
             />
           )}
-          {inspectorTab === 'rules' && <RuleDetailPanel state={state} onUpdateRule={updateRule} onDeleteRule={(ruleId) => {
-            commit('删除转录规则', (current) => analyzeProject({
-              ...current,
-              ruleSets: current.ruleSets.map((set) => set.id === current.activeRuleSetId ? { ...set, rules: set.rules.filter((rule) => rule.id !== ruleId) } : set),
-            }));
-          }} />}
+          {inspectorTab === 'rules' && <RuleDetailPanel state={state} onUpdateRule={updateRule} onPreviewChange={setPendingChange} />}
           {inspectorTab === 'versions' && <VersionsPanel state={state} onSnapshot={() => recordVersion()} onRestore={(version) => {
             const restored: ProjectState = cloneState({ ...version.snapshot, versions: state.versions });
             restore(restored);
           }} />}
         </aside>
       </div>
+
+      {pendingChange && (
+        <RuleChangeDialog
+          state={state}
+          pending={pendingChange}
+          selectedLineId={state.selectedLineId}
+          onApplyAll={applyPendingChange}
+          onPinLine={pinLineFromPending}
+          onCancel={closePendingChange}
+        />
+      )}
     </div>
   );
 }

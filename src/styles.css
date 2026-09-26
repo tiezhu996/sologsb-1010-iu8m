@@ -66,7 +66,7 @@ md-text-button, md-filled-button, md-outlined-button, md-filled-tonal-button { w
 .status-ribbon {
   height: 62px;
   display: grid;
-  grid-template-columns: minmax(260px, 1fr) repeat(3, 118px) minmax(380px, 1.4fr);
+  grid-template-columns: minmax(240px, 1fr) repeat(4, 112px) minmax(360px, 1.4fr);
   align-items: center;
   gap: 16px;
   padding: 7px 20px;
@@ -82,6 +82,10 @@ md-linear-progress { width: 100%; --md-linear-progress-active-indicator-color: #
 .status-stat strong { font-size: 18px; }
 .status-stat span { color: var(--muted); font-size: 11px; }
 .status-stat.warning strong { color: var(--warning); }
+.pinned-stat { border: 0; background: transparent; padding: 0 0 0 16px; text-align: left; cursor: pointer; font: inherit; }
+.pinned-stat strong { color: #315e70; }
+.pinned-stat:hover:not(:disabled) strong { text-decoration: underline; }
+.pinned-stat:disabled { cursor: default; opacity: .75; }
 .shortcut-hint { color: #586863; font-size: 11px; line-height: 1.5; text-align: right; }
 
 .workspace-grid { height: calc(100vh - 134px); display: grid; grid-template-columns: 310px minmax(560px, 1fr) 370px; overflow: hidden; }
@@ -113,6 +117,10 @@ md-linear-progress { width: 100%; --md-linear-progress-active-indicator-color: #
   align-items: center; gap: 5px; padding: 6px; border: 1px solid transparent; border-radius: 9px;
 }
 .rule-row.suspicious { background: #fff7e9; border-color: #efd7ad; }
+.rule-row.draft { border-color: #bcd4cb; background: #f2f8f5; }
+.rule-draft-bar { grid-column: 2 / -1; display: flex; align-items: center; gap: 4px; }
+.rule-draft-bar > span { color: var(--warning); font-size: 10px; }
+.rule-draft-bar md-filled-tonal-button { margin-left: auto; }
 .rule-row md-outlined-text-field { --md-outlined-text-field-container-height: 38px; font-size: 11px; min-width: 0; }
 .warning-button { --md-icon-button-icon-size: 18px; }
 .warning-button.active { color: var(--warning); }
@@ -134,11 +142,19 @@ md-linear-progress { width: 100%; --md-linear-progress-active-indicator-color: #
   border: 1px solid #d7dfdc; border-radius: 12px; box-shadow: 0 2px 8px rgba(20,47,40,.04); overflow: hidden;
 }
 .line-card.selected { border-color: #4d806f; box-shadow: 0 0 0 2px rgba(77,128,111,.13), 0 5px 16px rgba(20,47,40,.08); }
+.line-card.pinned { border-color: #9fc4d8; box-shadow: inset 3px 0 #5c86a5, 0 2px 8px rgba(20,47,40,.04); }
+.line-card.pinned.selected { border-color: #4d806f; }
 .line-gutter { padding: 14px 0; display: flex; flex-direction: column; align-items: center; gap: 10px; background: #eef3f0; border-right: 1px solid #dde4e1; color: #6c7c77; font: 600 11px/1 monospace; }
 .line-status { width: 8px; height: 8px; border-radius: 50%; background: #9aa5a1; }
 .line-status.questionable { background: #d68a1f; }
 .line-status.reviewed { background: #5c86a5; }
 .line-status.approved { background: #3d8a64; box-shadow: 0 0 0 3px #dcefe5; }
+.line-status.pinned { background: #5c86a5; box-shadow: 0 0 0 3px #dcebf4; position: relative; }
+.line-status.pinned::after { content: '定'; position: absolute; inset: 0; display: grid; place-items: center; color: white; font-size: 6px; line-height: 1; }
+.override-bar { display: flex; align-items: center; gap: 8px; padding: 5px 3px 0; flex-wrap: wrap; }
+.override-badge { display: inline-block; padding: 3px 8px; border-radius: 5px; background: #e2f0f8; color: #275163; font-size: 10px; font-weight: 700; letter-spacing: .08em; }
+.override-meta { color: var(--muted); font-size: 10px; }
+.override-bar md-text-button { margin-left: auto; }
 .line-body { min-width: 0; padding: 12px 14px 13px; }
 .line-source { display: flex; align-items: flex-start; gap: 10px; }
 .line-source textarea {
@@ -157,6 +173,9 @@ md-linear-progress { width: 100%; --md-linear-progress-active-indicator-color: #
 .braille-token span { margin-top: 3px; font: 22px/1.05 "Apple Braille", "Segoe UI Symbol", sans-serif; }
 .braille-token.suspicious { background: #fff3df; box-shadow: inset 0 -2px #e3a342; }
 .braille-token.error { background: #ffebe9; color: var(--danger); }
+.braille-token.override { background: #e8f2f8; box-shadow: inset 0 -2px #5c86a5; padding: 4px 8px 5px; }
+.braille-token.override i { color: #3f6a80; font-style: normal; font: 700 9px/1.2 sans-serif; letter-spacing: .1em; }
+.braille-token.override span { font-size: 22px; }
 .space-token { width: 10px; height: 28px; border-bottom: 1px dotted #b7c2be; }
 .empty-preview { color: #98a39f; font-size: 12px; }
 .line-warnings { padding-top: 8px; display: flex; flex-wrap: wrap; gap: 5px; }
@@ -203,13 +222,53 @@ md-linear-progress { width: 100%; --md-linear-progress-active-indicator-color: #
 @media (max-width: 1320px) {
   .workspace-grid { grid-template-columns: 285px minmax(520px, 1fr) 330px; }
   .shortcut-hint { display: none; }
-  .status-ribbon { grid-template-columns: minmax(220px, 1fr) repeat(3, 105px); }
+  .status-ribbon { grid-template-columns: minmax(200px, 1fr) repeat(4, 96px); }
   .topbar-center small { display: none; }
 }
 
+.dialog-backdrop {
+  position: fixed; inset: 0; z-index: 60;
+  background: rgba(12, 28, 24, .46);
+  display: grid; place-items: center; padding: 32px;
+}
+.change-dialog {
+  width: min(820px, 100%); max-height: 84vh;
+  display: flex; flex-direction: column;
+  background: var(--paper); border-radius: 14px;
+  border: 1px solid #c9d5d1; box-shadow: 0 24px 60px rgba(8, 30, 25, .32);
+  overflow: hidden;
+}
+.change-dialog-head {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+  padding: 18px 20px 14px; background: #f2f8f5; border-bottom: 1px solid var(--line);
+}
+.change-dialog-head h2 { margin: 4px 0 2px; font: 700 17px/1.3 Georgia, serif; }
+.change-dialog-head p { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.change-dialog-summary { display: flex; align-items: center; gap: 8px; padding: 10px 20px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.diff-count-badge { display: inline-block; padding: 4px 10px; border-radius: 6px; background: #e4f0ea; color: #225745; font-size: 11px; font-weight: 700; }
+.pinned-count-badge { display: inline-block; padding: 4px 10px; border-radius: 6px; background: #e2f0f8; color: #275163; font-size: 11px; font-weight: 700; }
+.no-diff-hint { color: var(--muted); font-size: 11px; }
+.change-dialog-body { flex: 1; overflow: auto; padding: 12px 20px; display: flex; flex-direction: column; gap: 10px; }
+.diff-row { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: white; }
+.diff-row.current { border-color: #4d806f; box-shadow: 0 0 0 2px rgba(77,128,111,.12); }
+.diff-line-meta { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; }
+.diff-line-meta strong { font-size: 12px; color: #2b4d43; }
+.current-line-tag { font-size: 9px; font-weight: 700; color: white; background: #4d806f; border-radius: 4px; padding: 2px 6px; letter-spacing: .1em; }
+.diff-source { color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.diff-braille { display: grid; grid-template-columns: 44px 1fr; gap: 8px; align-items: baseline; padding: 5px 8px; border-radius: 7px; }
+.diff-braille span { color: var(--muted); font-size: 10px; }
+.diff-braille p { margin: 0; font: 19px/1.4 "Apple Braille", "Segoe UI Symbol", sans-serif; word-break: break-all; }
+.diff-braille.before { background: #fdf0ee; }
+.diff-braille.before p { color: #8c3a32; text-decoration: line-through; text-decoration-color: rgba(140, 58, 50, .45); }
+.diff-braille.after { background: #edf7f1; }
+.diff-braille.after p { color: #1f5e46; }
+.diff-arrow { text-align: center; color: #93a39e; font-size: 11px; line-height: 1; }
+.change-dialog-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 12px 20px; border-top: 1px solid var(--line); background: #f7faf8; }
+.change-dialog-foot .foot-right { display: flex; align-items: center; gap: 8px; }
+
 @media print {
   body { min-width: 0; overflow: visible; }
-  .topbar, .status-ribbon, .left-panel, .right-panel, .editor-toolbar, .line-actions, .note-field { display: none !important; }
+  .topbar, .status-ribbon, .left-panel, .right-panel, .editor-toolbar, .line-actions, .note-field, .override-bar md-text-button { display: none !important; }
   .workspace-grid, .editor-panel, .line-list { display: block; height: auto; overflow: visible; background: white; padding: 0; }
   .line-card { break-inside: avoid; box-shadow: none; }
 }

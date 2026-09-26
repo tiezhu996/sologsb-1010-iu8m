@@ -161,13 +161,29 @@ function issue(
   };
 }
 
+function overrideTokens(line: TextbookLine): BrailleToken[] {
+  const override = line.override;
+  if (!override) return [];
+  return [{
+    id: uid('token'),
+    text: line.source,
+    braille: override.braille,
+    kind: 'special',
+    suspicious: false,
+    offset: 0,
+    override: true,
+  }];
+}
+
 function analyzeLine(line: TextbookLine, previousLine?: TextbookLine): { line: TextbookLine; issues: ProofIssue[] } {
   const issues: ProofIssue[] = [];
+  const pinned = Boolean(line.override && line.override.source === line.source);
   const tokenText = line.tokens.map((token) => token.braille).join('');
   const hasContinuation = line.source.trimEnd().endsWith('-');
   const previousContinues = Boolean(previousLine?.source.trimEnd().endsWith('-'));
   const nextLine = {
     ...line,
+    override: pinned ? line.override : undefined,
     continuesPrevious: previousContinues,
     continuesNext: hasContinuation,
   };
@@ -177,6 +193,7 @@ function analyzeLine(line: TextbookLine, previousLine?: TextbookLine): { line: T
   }
 
   for (const token of nextLine.tokens) {
+    if (pinned) continue;
     if (token.suspicious) {
       issues.push(issue(nextLine, 'suspicious-rule', `规则“${token.text}”被标记为可疑转写。`, 'warning', token));
     }
@@ -193,9 +210,9 @@ function analyzeLine(line: TextbookLine, previousLine?: TextbookLine): { line: T
     issues.push(issue(nextLine, 'orphan-fragment', '断词后仅剩一个字母，教学排版中通常应整体移到下一行。', 'warning'));
   }
 
-  if (issues.some((item) => item.severity === 'error')) {
+  if (!pinned && issues.some((item) => item.severity === 'error')) {
     nextLine.status = 'questionable';
-  } else if (issues.length > 0 && nextLine.status === 'unchecked') {
+  } else if (!pinned && issues.length > 0 && nextLine.status === 'unchecked') {
     nextLine.status = 'questionable';
   }
 
@@ -209,7 +226,8 @@ export function analyzeProject(state: ProjectState): ProjectState {
 
   state.lines.forEach((line, index) => {
     const previousSourceContinues = Boolean(state.lines[index - 1]?.source.trimEnd().endsWith('-'));
-    const tokens = transcribeLine(line.source, ruleSet, previousSourceContinues);
+    const pinned = Boolean(line.override && line.override.source === line.source);
+    const tokens = pinned ? overrideTokens(line) : transcribeLine(line.source, ruleSet, previousSourceContinues);
     const analyzed = analyzeLine({ ...line, tokens }, state.lines[index - 1]);
     nextLines.push(analyzed.line);
     issues.push(...analyzed.issues);
@@ -244,7 +262,23 @@ export function makeRule(source: string, output: string, suspicious: boolean, ki
 }
 
 export function outputText(state: ProjectState): string {
-  return state.lines.map((line, index) => `${String(index + 1).padStart(3, '0')}  ${line.tokens.map((token) => token.braille).join('')}`).join('\n');
+  return state.lines.map((line, index) => `${String(index + 1).padStart(3, '0')}  ${lineBraille(line)}`).join('\n');
+}
+
+export function lineBraille(line: TextbookLine): string {
+  return line.tokens.map((token) => token.braille).join('');
+}
+
+export function pinLine(line: TextbookLine, ruleSummary: string): TextbookLine {
+  return {
+    ...line,
+    override: {
+      source: line.source,
+      braille: lineBraille(line),
+      ruleSummary,
+      createdAt: new Date().toISOString(),
+    },
+  };
 }
 
 export function brailleCellCount(state: ProjectState): number {

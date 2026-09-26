@@ -29,6 +29,14 @@ export interface BrailleToken {
   ruleId?: string;
   suspicious: boolean;
   offset: number;
+  override?: boolean;
+}
+
+export interface LineOverride {
+  source: string;
+  braille: string;
+  ruleSummary: string;
+  createdAt: string;
 }
 
 export interface TextbookLine {
@@ -39,6 +47,7 @@ export interface TextbookLine {
   note: string;
   continuesPrevious: boolean;
   continuesNext: boolean;
+  override?: LineOverride;
 }
 
 export interface ProofIssue {
