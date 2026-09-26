@@ -142,6 +142,16 @@ export function transcribeLine(source: string, ruleSet: RuleSet, continuesPrevio
   return tokens;
 }
 
+/** 行的有效盲文：有未作废的单独结果时以单独结果为准，否则用规则转写的 token。 */
+export function effectiveBraille(line: TextbookLine): string {
+  if (line.override && line.override.source === line.source) return line.override.braille;
+  return line.tokens.map((token) => token.braille).join('');
+}
+
+export function hasActiveOverride(line: TextbookLine): boolean {
+  return Boolean(line.override && line.override.source === line.source);
+}
+
 function issue(
   line: TextbookLine,
   code: string,
@@ -163,7 +173,8 @@ function issue(
 
 function analyzeLine(line: TextbookLine, previousLine?: TextbookLine): { line: TextbookLine; issues: ProofIssue[] } {
   const issues: ProofIssue[] = [];
-  const tokenText = line.tokens.map((token) => token.braille).join('');
+  const overrideActive = hasActiveOverride(line);
+  const tokenText = overrideActive ? line.override!.braille : line.tokens.map((token) => token.braille).join('');
   const hasContinuation = line.source.trimEnd().endsWith('-');
   const previousContinues = Boolean(previousLine?.source.trimEnd().endsWith('-'));
   const nextLine = {
@@ -176,12 +187,14 @@ function analyzeLine(line: TextbookLine, previousLine?: TextbookLine): { line: T
     issues.push(issue(nextLine, 'cross-line-hyphen', '此行以连字符结尾，已插入跨行连接标记；请核对断词位置。', 'warning', nextLine.tokens.at(-1)));
   }
 
-  for (const token of nextLine.tokens) {
-    if (token.suspicious) {
-      issues.push(issue(nextLine, 'suspicious-rule', `规则“${token.text}”被标记为可疑转写。`, 'warning', token));
-    }
-    if (token.text && token.braille.includes('⟦')) {
-      issues.push(issue(nextLine, 'unknown-symbol', `“${token.text}”没有可用的转写规则。`, 'error', token));
+  if (!overrideActive) {
+    for (const token of nextLine.tokens) {
+      if (token.suspicious) {
+        issues.push(issue(nextLine, 'suspicious-rule', `规则“${token.text}”被标记为可疑转写。`, 'warning', token));
+      }
+      if (token.text && token.braille.includes('⟦')) {
+        issues.push(issue(nextLine, 'unknown-symbol', `“${token.text}”没有可用的转写规则。`, 'error', token));
+      }
     }
   }
 
@@ -209,8 +222,10 @@ export function analyzeProject(state: ProjectState): ProjectState {
 
   state.lines.forEach((line, index) => {
     const previousSourceContinues = Boolean(state.lines[index - 1]?.source.trimEnd().endsWith('-'));
-    const tokens = transcribeLine(line.source, ruleSet, previousSourceContinues);
-    const analyzed = analyzeLine({ ...line, tokens }, state.lines[index - 1]);
+    // 原文在单独处理之后被改动过，则单独结果作废，重新按规则转写。
+    const currentLine = line.override && line.override.source !== line.source ? { ...line, override: null } : line;
+    const tokens = transcribeLine(currentLine.source, ruleSet, previousSourceContinues);
+    const analyzed = analyzeLine({ ...currentLine, tokens }, state.lines[index - 1]);
     nextLines.push(analyzed.line);
     issues.push(...analyzed.issues);
   });
@@ -243,10 +258,43 @@ export function makeRule(source: string, output: string, suspicious: boolean, ki
   };
 }
 
+export interface AffectedLinePreview {
+  lineId: string;
+  lineNumber: number;
+  source: string;
+  before: string;
+  after: string;
+}
+
+/**
+ * 对比规则修改前后的两份状态，列出盲文结果会发生变化的行（改前/改后），
+ * 并统计有单独结果、不受本次修改影响的行数。
+ */
+export function diffRuleChange(before: ProjectState, after: ProjectState): { affected: AffectedLinePreview[]; protectedCount: number } {
+  const affected: AffectedLinePreview[] = [];
+  let protectedCount = 0;
+
+  after.lines.forEach((line, index) => {
+    const previous = before.lines[index];
+    if (!previous) return;
+    if (hasActiveOverride(previous)) {
+      protectedCount += 1;
+      return;
+    }
+    const beforeText = effectiveBraille(previous);
+    const afterText = effectiveBraille(line);
+    if (beforeText !== afterText) {
+      affected.push({ lineId: line.id, lineNumber: index + 1, source: line.source, before: beforeText, after: afterText });
+    }
+  });
+
+  return { affected, protectedCount };
+}
+
 export function outputText(state: ProjectState): string {
-  return state.lines.map((line, index) => `${String(index + 1).padStart(3, '0')}  ${line.tokens.map((token) => token.braille).join('')}`).join('\n');
+  return state.lines.map((line, index) => `${String(index + 1).padStart(3, '0')}  ${effectiveBraille(line)}`).join('\n');
 }
 
 export function brailleCellCount(state: ProjectState): number {
-  return state.lines.reduce((total, line) => total + line.tokens.reduce((count, token) => count + token.braille.replace(/\s/g, '').length, 0), 0);
+  return state.lines.reduce((total, line) => total + effectiveBraille(line).replace(/\s/g, '').length, 0);
 }

@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
-import { analyzeProject, brailleCellCount, makeRule, outputText, updateRuleInSet } from './braille';
+import { analyzeProject, brailleCellCount, diffRuleChange, effectiveBraille, hasActiveOverride, makeRule, outputText, updateRuleInSet } from './braille';
+import type { AffectedLinePreview } from './braille';
 import { createInitialProject } from './sample';
-import type { HistoryState, ProofIssue, ProjectState, TextbookLine, VersionSnapshot } from './types';
+import type { HistoryState, ProofIssue, ProjectState, TextbookLine, TranscriptionRule, VersionSnapshot } from './types';
 
 const STORAGE_KEY = 'sologsb-1010-braille-project-v1';
 const HISTORY_LIMIT = 60;
@@ -108,6 +109,54 @@ function Section({ title, subtitle, action, children }: { title: string; subtitl
   );
 }
 
+/** 待确认的规则修改：先预览影响，再决定只改当前行还是整份一起改。 */
+interface PendingRuleChange {
+  title: string;
+  summary: string;
+  affected: AffectedLinePreview[];
+  protectedCount: number;
+  /** 基于给定状态应用修改并重新检查全文 */
+  computeNext: (state: ProjectState) => ProjectState;
+}
+
+function RuleRowEditor({ rule, onRequestUpdate }: { rule: TranscriptionRule; onRequestUpdate: (patch: Record<string, unknown>) => void }) {
+  const [draftSource, setDraftSource] = useState(rule.source);
+  const [draftOutput, setDraftOutput] = useState(rule.output);
+
+  useEffect(() => {
+    setDraftSource(rule.source);
+    setDraftOutput(rule.output);
+  }, [rule.source, rule.output]);
+
+  const dirty = draftSource !== rule.source || draftOutput !== rule.output;
+  const apply = () => {
+    if (dirty && draftSource.trim()) onRequestUpdate({ source: draftSource.trim(), output: draftOutput });
+  };
+  const onKeyDown = (event: KeyboardEvent) => {
+    if (event.key === 'Enter') apply();
+  };
+
+  return (
+    <div class={`rule-row ${rule.suspicious ? 'suspicious' : ''}`}>
+      <md-checkbox checked={rule.enabled} onInput={() => onRequestUpdate({ enabled: !rule.enabled })} aria-label={`启用 ${rule.source}`} />
+      <md-outlined-text-field class="rule-source" value={draftSource} label="原文" onInput={(event: any) => setDraftSource(event.currentTarget.value)} onKeydown={onKeyDown} />
+      <md-outlined-text-field class="rule-output" value={draftOutput} label="盲文" onInput={(event: any) => setDraftOutput(event.currentTarget.value)} onKeydown={onKeyDown} />
+      {dirty ? (
+        <md-icon-button class="apply-button" aria-label="预览修改影响" title="预览修改影响" disabled={!draftSource.trim()} onClick={apply}>✓</md-icon-button>
+      ) : (
+        <md-icon-button
+          class={rule.suspicious ? 'warning-button active' : 'warning-button'}
+          aria-label={rule.suspicious ? '取消可疑标记' : '标记为可疑'}
+          title={rule.suspicious ? '取消可疑标记' : '标记为可疑'}
+          onClick={() => onRequestUpdate({ suspicious: !rule.suspicious })}
+        >
+          {rule.suspicious ? '!' : '○'}
+        </md-icon-button>
+      )}
+    </div>
+  );
+}
+
 function RuleSetPanel({
   state,
   onSelect,
@@ -159,32 +208,10 @@ function RuleSetPanel({
         </div>
       </Section>
 
-      <Section title="缩写与标点" subtitle="可疑规则会在校对区生成提醒">
+      <Section title="缩写与标点" subtitle="修改会先预览受影响行，再决定改当前行还是整份">
         <div class="rule-list">
           {visibleRules.map((rule) => (
-            <div class={`rule-row ${rule.suspicious ? 'suspicious' : ''}`} key={rule.id}>
-              <md-checkbox checked={rule.enabled} onInput={() => onUpdateRule(rule.id, { enabled: !rule.enabled })} aria-label={`启用 ${rule.source}`} />
-              <md-outlined-text-field
-                class="rule-source"
-                value={rule.source}
-                label="原文"
-                onInput={(event: any) => onUpdateRule(rule.id, { source: event.currentTarget.value })}
-              />
-              <md-outlined-text-field
-                class="rule-output"
-                value={rule.output}
-                label="盲文"
-                onInput={(event: any) => onUpdateRule(rule.id, { output: event.currentTarget.value })}
-              />
-              <md-icon-button
-                class={rule.suspicious ? 'warning-button active' : 'warning-button'}
-                aria-label={rule.suspicious ? '取消可疑标记' : '标记为可疑'}
-                title={rule.suspicious ? '取消可疑标记' : '标记为可疑'}
-                onClick={() => onUpdateRule(rule.id, { suspicious: !rule.suspicious })}
-              >
-                {rule.suspicious ? '!' : '○'}
-              </md-icon-button>
-            </div>
+            <RuleRowEditor key={rule.id} rule={rule} onRequestUpdate={(patch) => onUpdateRule(rule.id, patch)} />
           ))}
         </div>
       </Section>
@@ -220,6 +247,7 @@ function LineCard({
   onNote,
   onStatus,
   onDelete,
+  onRevertOverride,
 }: {
   line: TextbookLine;
   index: number;
@@ -230,9 +258,11 @@ function LineCard({
   onNote: (note: string) => void;
   onStatus: (status: TextbookLine['status']) => void;
   onDelete: () => void;
+  onRevertOverride: () => void;
 }) {
   const unresolved = issues.filter((issue) => !issue.resolved);
   const lineIssues = unresolved.filter((issue) => issue.lineId === line.id);
+  const overrideActive = hasActiveOverride(line);
 
   return (
     <article class={`line-card ${selected ? 'selected' : ''}`} id={`line-card-${line.id}`} onClick={onSelect}>
@@ -257,19 +287,39 @@ function LineCard({
           </div>
         </div>
         <div class="braille-preview" aria-label={`第 ${index + 1} 行盲文预览`}>
-          {line.tokens.length === 0 && <span class="empty-preview">空行</span>}
-          {line.tokens.map((token) => (
-            token.text === ' ' ? <span class="space-token" title="分词空格" /> : (
-              <span
-                class={`braille-token ${token.suspicious ? 'suspicious' : ''} ${token.braille.includes('⟦') ? 'error' : ''}`}
-                title={`${token.text || '标记'} → ${token.braille}`}
-              >
-                <b>{token.text || '标记'}</b>
-                <span>{token.braille}</span>
+          {overrideActive ? (
+            <div class="override-result">
+              <span class="override-tag" title={line.override!.note ? `备注：${line.override!.note}` : '此行使用老师定下的单独结果'}>
+                单独处理{line.override!.note ? ` · ${line.override!.note}` : ''}
               </span>
-            )
-          ))}
+              <span class="override-braille">{line.override!.braille}</span>
+              <md-icon-button
+                aria-label="恢复按规则转写"
+                title="作废单独结果，恢复按规则转写"
+                onClick={(event: MouseEvent) => { event.stopPropagation(); onRevertOverride(); }}
+              >
+                ↩
+              </md-icon-button>
+            </div>
+          ) : (
+            line.tokens.length === 0 ? <span class="empty-preview">空行</span> : line.tokens.map((token) => (
+              token.text === ' ' ? <span class="space-token" title="分词空格" /> : (
+                <span
+                  class={`braille-token ${token.suspicious ? 'suspicious' : ''} ${token.braille.includes('⟦') ? 'error' : ''}`}
+                  title={`${token.text || '标记'} → ${token.braille}`}
+                >
+                  <b>{token.text || '标记'}</b>
+                  <span>{token.braille}</span>
+                </span>
+              )
+            ))
+          )}
         </div>
+        {overrideActive && (
+          <div class="override-rule-result">
+            按规则应为：<span>{line.tokens.map((token) => token.braille).join('') || '（空）'}</span>
+          </div>
+        )}
         {lineIssues.length > 0 && (
           <div class="line-warnings">
             {lineIssues.slice(0, 3).map((item) => (
@@ -297,6 +347,7 @@ function EditorPanel({
   onNote,
   onStatus,
   onDelete,
+  onRevertOverride,
   onAddLine,
   onSplitLongLines,
   onImport,
@@ -307,6 +358,7 @@ function EditorPanel({
   onNote: (id: string, note: string) => void;
   onStatus: (id: string, status: TextbookLine['status']) => void;
   onDelete: (id: string) => void;
+  onRevertOverride: (id: string) => void;
   onAddLine: () => void;
   onSplitLongLines: () => void;
   onImport: (text: string) => void;
@@ -367,6 +419,7 @@ function EditorPanel({
             onNote={(note) => onNote(line.id, note)}
             onStatus={(status) => onStatus(line.id, status)}
             onDelete={() => onDelete(line.id)}
+            onRevertOverride={() => onRevertOverride(line.id)}
           />
         ))}
       </div>
@@ -482,12 +535,15 @@ function VersionsPanel({ state, onSnapshot, onRestore }: { state: ProjectState; 
 export default function App() {
   const { state, history, commit, undo, redo, restore } = useProject();
   const [inspectorTab, setInspectorTab] = useState<'issues' | 'rules' | 'versions'>('issues');
+  const [pendingChange, setPendingChange] = useState<PendingRuleChange | null>(null);
+  const [overrideNote, setOverrideNote] = useState('');
   const selectedLineRef = useRef(state.selectedLineId);
   selectedLineRef.current = state.selectedLineId;
 
   const activeRuleSet = state.ruleSets.find((ruleSet) => ruleSet.id === state.activeRuleSetId) ?? state.ruleSets[0];
   const unresolvedCount = state.issues.filter((issue) => !issue.resolved).length;
   const approvedCount = state.lines.filter((line) => line.status === 'approved').length;
+  const overrideCount = state.lines.filter(hasActiveOverride).length;
   const progress = state.lines.length ? Math.round((approvedCount / state.lines.length) * 100) : 0;
 
   const selectLine = (lineId: string, scroll = false) => {
@@ -518,6 +574,11 @@ export default function App() {
       const modifier = event.metaKey || event.ctrlKey;
       const target = event.target as HTMLElement;
       const editing = /INPUT|TEXTAREA/.test(target.tagName) || target.isContentEditable;
+      if (pendingChange && event.key === 'Escape') {
+        event.preventDefault();
+        setPendingChange(null);
+        return;
+      }
       if (modifier && event.key.toLocaleLowerCase() === 'z') {
         event.preventDefault();
         event.shiftKey ? redo() : undo();
@@ -576,27 +637,91 @@ export default function App() {
   const exportPrint = () => {
     const printWindow = window.open('', '_blank', 'width=900,height=1100');
     if (!printWindow) return;
+    const escapeHtml = (text: string) => text.replace(/[<>&]/g, (char) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[char] ?? char));
     const rows = state.lines.map((line, index) => `
-      <tr><td>${index + 1}</td><td>${line.source.replace(/[<>&]/g, (char) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[char] ?? char))}</td><td class="braille">${line.tokens.map((token) => token.braille).join('')}</td></tr>
+      <tr><td>${index + 1}</td><td>${escapeHtml(line.source)}</td><td class="braille">${escapeHtml(effectiveBraille(line))}${hasActiveOverride(line) ? '<span class="manual">单独</span>' : ''}</td></tr>
     `).join('');
-    printWindow.document.write(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>${state.title}</title><style>body{font-family:Georgia,serif;color:#111;margin:36px}h1{font-size:22px}table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px solid #bbb;text-align:left;vertical-align:top}td:first-child{width:36px;color:#666}.braille{font-family:"Apple Braille",sans-serif;font-size:24px}@media print{body{margin:16mm}}</style></head><body><h1>${state.title}</h1><p>${state.author} · ${activeRuleSet.name} · ${new Date().toLocaleDateString('zh-CN')}</p><table><thead><tr><th>#</th><th>原文</th><th>盲文校对稿</th></tr></thead><tbody>${rows}</tbody></table><script>window.onload=()=>setTimeout(()=>window.print(),150)</script></body></html>`);
+    printWindow.document.write(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>${state.title}</title><style>body{font-family:Georgia,serif;color:#111;margin:36px}h1{font-size:22px}table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px solid #bbb;text-align:left;vertical-align:top}td:first-child{width:36px;color:#666}.braille{font-family:"Apple Braille",sans-serif;font-size:24px}.manual{margin-left:10px;padding:1px 6px;border:1px solid #7a97c8;border-radius:8px;color:#24507a;font-family:sans-serif;font-size:10px;vertical-align:middle}@media print{body{margin:16mm}}</style></head><body><h1>${state.title}</h1><p>${state.author} · ${activeRuleSet.name} · ${new Date().toLocaleDateString('zh-CN')}${overrideCount > 0 ? ` · ${overrideCount} 行单独处理` : ''}</p><table><thead><tr><th>#</th><th>原文</th><th>盲文校对稿</th></tr></thead><tbody>${rows}</tbody></table><script>window.onload=()=>setTimeout(()=>window.print(),150)</script></body></html>`);
     printWindow.document.close();
   };
 
+  const describeRulePatch = (ruleId: string, patch: Record<string, unknown>): string => {
+    const rule = activeRuleSet.rules.find((item) => item.id === ruleId);
+    if (!rule) return '';
+    if (patch.enabled === false) return `停用规则「${rule.source || '数字符'} → ${rule.output}」`;
+    if (patch.enabled === true) return `启用规则「${rule.source || '数字符'} → ${rule.output}」`;
+    const source = typeof patch.source === 'string' ? patch.source : rule.source;
+    const output = typeof patch.output === 'string' ? patch.output : rule.output;
+    return `「${rule.source || '数字符'} → ${rule.output}」改为「${source || '数字符'} → ${output}」`;
+  };
+
+  /** 先算出影响清单；没有行会变就直接提交，否则打开预览对话框。 */
+  const requestRuleChange = (title: string, summary: string, computeNext: (state: ProjectState) => ProjectState) => {
+    const { affected, protectedCount } = diffRuleChange(state, computeNext(state));
+    if (affected.length === 0) {
+      commit(title, computeNext);
+      return;
+    }
+    setOverrideNote('');
+    setPendingChange({ title, summary, affected, protectedCount, computeNext });
+  };
+
   const updateRule = (ruleId: string, patch: Record<string, unknown>) => {
-    commit('修改转录规则', (current) => {
+    const computeNext = (current: ProjectState) => {
       const ruleSet = current.ruleSets.find((set) => set.id === current.activeRuleSetId) ?? current.ruleSets[0];
       const nextSet = updateRuleInSet(ruleSet, ruleId, patch);
       return analyzeProject({ ...current, ruleSets: current.ruleSets.map((set) => set.id === nextSet.id ? nextSet : set) });
+    };
+    requestRuleChange('修改转录规则', describeRulePatch(ruleId, patch), computeNext);
+  };
+
+  const deleteRule = (ruleId: string) => {
+    const computeNext = (current: ProjectState) => analyzeProject({
+      ...current,
+      ruleSets: current.ruleSets.map((set) => set.id === current.activeRuleSetId ? { ...set, rules: set.rules.filter((rule) => rule.id !== ruleId) } : set),
     });
+    const rule = activeRuleSet.rules.find((item) => item.id === ruleId);
+    requestRuleChange('删除转录规则', `删除规则「${rule?.source || '数字符'} → ${rule?.output ?? ''}」`, computeNext);
+  };
+
+  const applyChangeToAll = () => {
+    if (!pendingChange) return;
+    commit(pendingChange.title, (current) => pendingChange.computeNext(current));
+    setPendingChange(null);
+  };
+
+  const applyChangeToCurrentLine = () => {
+    if (!pendingChange) return;
+    const note = overrideNote.trim();
+    commit('单独处理当前行', (current) => {
+      const next = pendingChange.computeNext(current);
+      const target = next.lines.find((line) => line.id === current.selectedLineId);
+      if (!target || hasActiveOverride(target)) return current;
+      const braille = target.tokens.map((token) => token.braille).join('');
+      return analyzeProject({
+        ...current,
+        lines: current.lines.map((line) => line.id === current.selectedLineId
+          ? { ...line, override: { source: line.source, braille, note, updatedAt: new Date().toISOString() } }
+          : line),
+      });
+    });
+    setPendingChange(null);
+  };
+
+  const revertOverride = (lineId: string) => {
+    commit('恢复按规则转写', (current) => analyzeProject({
+      ...current,
+      lines: current.lines.map((line) => line.id === lineId ? { ...line, override: null } : line),
+    }));
   };
 
   const batchFixRule = (ruleId: string) => {
-    commit('批量修正同类问题', (current) => {
+    const computeNext = (current: ProjectState) => {
       const ruleSet = current.ruleSets.find((set) => set.id === current.activeRuleSetId) ?? current.ruleSets[0];
       const nextSet = updateRuleInSet(ruleSet, ruleId, { enabled: false });
       return analyzeProject({ ...current, ruleSets: current.ruleSets.map((set) => set.id === nextSet.id ? nextSet : set) });
-    });
+    };
+    requestRuleChange('批量修正同类问题', describeRulePatch(ruleId, { enabled: false }), computeNext);
   };
 
   const importCourse = (text: string) => {
@@ -612,6 +737,9 @@ export default function App() {
       issues: [],
     }));
   };
+
+  const selectedLineNumber = state.lines.findIndex((line) => line.id === state.selectedLineId) + 1;
+  const currentLineAffected = Boolean(pendingChange?.affected.some((item) => item.lineId === state.selectedLineId));
 
   return (
     <div class="app-shell">
@@ -640,6 +768,7 @@ export default function App() {
         </div>
         <div class="status-stat warning"><strong>{unresolvedCount}</strong><span>未处理问题</span></div>
         <div class="status-stat"><strong>{state.lines.filter((line) => line.status === 'questionable').length}</strong><span>待核对行</span></div>
+        <div class="status-stat override"><strong>{overrideCount}</strong><span>单独处理行</span></div>
         <div class="status-stat"><strong>{activeRuleSet.rules.filter((rule) => rule.enabled).length}</strong><span>启用规则</span></div>
         <div class="shortcut-hint">快捷键：⌘/Ctrl Z 撤销 · ⇧⌘/Ctrl Z 重做 · ⌘/Ctrl Enter 批准并下一行 · J/K 切换行</div>
       </div>
@@ -672,6 +801,7 @@ export default function App() {
             const lines = current.lines.filter((line) => line.id !== lineId);
             return analyzeProject({ ...current, lines: lines.length ? lines : [{ id: `line-${Date.now()}`, source: '', tokens: [], status: 'unchecked', note: '', continuesPrevious: false, continuesNext: false }], selectedLineId: lines[0]?.id ?? '' });
           })}
+          onRevertOverride={revertOverride}
           onAddLine={() => commit('新增课文行', (current) => {
             const line: TextbookLine = { id: `line-${Date.now()}`, source: '', tokens: [], status: 'unchecked', note: '', continuesPrevious: false, continuesNext: false };
             return analyzeProject({ ...current, lines: [...current.lines, line], selectedLineId: line.id });
@@ -701,18 +831,58 @@ export default function App() {
               onBatchFix={batchFixRule}
             />
           )}
-          {inspectorTab === 'rules' && <RuleDetailPanel state={state} onUpdateRule={updateRule} onDeleteRule={(ruleId) => {
-            commit('删除转录规则', (current) => analyzeProject({
-              ...current,
-              ruleSets: current.ruleSets.map((set) => set.id === current.activeRuleSetId ? { ...set, rules: set.rules.filter((rule) => rule.id !== ruleId) } : set),
-            }));
-          }} />}
+          {inspectorTab === 'rules' && <RuleDetailPanel state={state} onUpdateRule={updateRule} onDeleteRule={deleteRule} />}
           {inspectorTab === 'versions' && <VersionsPanel state={state} onSnapshot={() => recordVersion()} onRestore={(version) => {
             const restored: ProjectState = cloneState({ ...version.snapshot, versions: state.versions });
             restore(restored);
           }} />}
         </aside>
       </div>
+
+      {pendingChange && (
+        <div class="modal-backdrop" onClick={() => setPendingChange(null)}>
+          <div class="preview-dialog" role="dialog" aria-modal="true" aria-label="修改影响预览" onClick={(event) => event.stopPropagation()}>
+            <h2>{pendingChange.title} · 影响预览</h2>
+            <p class="dialog-summary">{pendingChange.summary}</p>
+            <p class="dialog-stats">
+              共 {pendingChange.affected.length} 行的盲文会变化
+              {pendingChange.protectedCount > 0 && `；${pendingChange.protectedCount} 行已单独处理，不受影响`}
+              。
+            </p>
+            <div class="affected-list scroll-pane">
+              {pendingChange.affected.map((item) => (
+                <div class={`affected-item ${item.lineId === state.selectedLineId ? 'current' : ''}`} key={item.lineId}>
+                  <span class="affected-no">{String(item.lineNumber).padStart(2, '0')}</span>
+                  <div class="affected-body">
+                    <span class="affected-source">{item.source || '（空行）'}</span>
+                    <div class="affected-diff">
+                      <span class="before" title="修改前">{item.before || '（空）'}</span>
+                      <span class="arrow">→</span>
+                      <span class="after" title="修改后">{item.after || '（空）'}</span>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <md-outlined-text-field
+              value={overrideNote}
+              label="单独处理备注（可选，如：3 班用完整拼写）"
+              onInput={(event: any) => setOverrideNote(event.currentTarget.value)}
+            />
+            <div class="dialog-actions">
+              <md-text-button onClick={() => setPendingChange(null)}>取消</md-text-button>
+              <md-filled-tonal-button
+                disabled={!currentLineAffected}
+                title={currentLineAffected ? '规则保持不变，仅当前行使用修改后的结果' : '当前选中行不受此修改影响'}
+                onClick={applyChangeToCurrentLine}
+              >
+                只改当前行{selectedLineNumber > 0 ? `（第 ${selectedLineNumber} 行）` : ''}
+              </md-filled-tonal-button>
+              <md-filled-button onClick={applyChangeToAll}>整份一起改</md-filled-button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

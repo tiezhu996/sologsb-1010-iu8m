@@ -31,6 +31,16 @@ export interface BrailleToken {
   offset: number;
 }
 
+export interface LineOverride {
+  /** 生效时的原文快照；原文之后被改动则覆盖结果作废 */
+  source: string;
+  /** 老师定下的整行盲文结果 */
+  braille: string;
+  /** 处理说明（如班级、原因） */
+  note: string;
+  updatedAt: string;
+}
+
 export interface TextbookLine {
   id: string;
   source: string;
@@ -39,6 +49,7 @@ export interface TextbookLine {
   note: string;
   continuesPrevious: boolean;
   continuesNext: boolean;
+  override?: LineOverride | null;
 }
 
 export interface ProofIssue {
